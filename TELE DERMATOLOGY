@@ -1,0 +1,283 @@
+# ============================================================
+# TELE-DERMATOLOGY CASE STUDY - FULL SINGLE PAGE IMPLEMENTATION
+# Classification + Segmentation using Google Drive
+# ============================================================
+
+# Install libraries
+!pip install tensorflow opencv-python scikit-learn matplotlib seaborn --quiet
+
+# ============================================================
+# STEP 1: CONNECT GOOGLE DRIVE
+# ============================================================
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+# SET THESE PATHS
+classification_path = "/content/drive/MyDrive/ham1000"
+seg_image_path = "/content/drive/MyDrive/ISIC/images"
+seg_mask_path = "/content/drive/MyDrive/ISIC/masks"
+
+
+# ============================================================
+# STEP 2: LOAD CLASSIFICATION DATASET
+# ============================================================
+
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+IMG_SIZE = 224
+BATCH_SIZE = 32
+
+datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2
+)
+
+train_gen = datagen.flow_from_directory(
+    classification_path,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    subset='training'
+)
+
+val_gen = datagen.flow_from_directory(
+    classification_path,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    subset='validation',
+    shuffle=False
+)
+
+
+# ============================================================
+# STEP 3: BUILD CLASSIFICATION MODEL (MobileNetV2)
+# ============================================================
+
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+from tensorflow.keras.models import Model
+
+base_model = MobileNetV2(
+    weights='imagenet',
+    include_top=False,
+    input_shape=(224,224,3)
+)
+
+x = GlobalAveragePooling2D()(base_model.output)
+
+output = Dense(
+    train_gen.num_classes,
+    activation='softmax'
+)(x)
+
+model = Model(base_model.input, output)
+
+model.compile(
+    optimizer='adam',
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+print("\nTraining Classification Model...")
+model.fit(train_gen, validation_data=val_gen, epochs=5)
+
+
+# ============================================================
+# STEP 4: CLASSIFICATION METRICS
+# ============================================================
+
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+
+pred = model.predict(val_gen)
+
+y_pred = np.argmax(pred, axis=1)
+y_true = val_gen.classes
+
+print("\nCLASSIFICATION RESULTS")
+
+print("Accuracy:", accuracy_score(y_true, y_pred))
+print("Precision:", precision_score(y_true, y_pred, average='weighted'))
+print("Recall:", recall_score(y_true, y_pred, average='weighted'))
+print("F1 Score:", f1_score(y_true, y_pred, average='weighted'))
+
+
+# ============================================================
+# STEP 5: CONFUSION MATRIX
+# ============================================================
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+cm = confusion_matrix(y_true, y_pred)
+
+plt.figure(figsize=(10,8))
+sns.heatmap(cm, annot=True, fmt="d")
+plt.title("Confusion Matrix")
+plt.show()
+
+
+# ============================================================
+# STEP 6: BRIGHTNESS ANALYSIS
+# ============================================================
+
+bright_gen = ImageDataGenerator(
+    rescale=1./255,
+    brightness_range=[0.5,1.5],
+    validation_split=0.2
+)
+
+bright_val = bright_gen.flow_from_directory(
+    classification_path,
+    target_size=(224,224),
+    batch_size=BATCH_SIZE,
+    subset='validation',
+    shuffle=False
+)
+
+bright_pred = model.predict(bright_val)
+bright_pred = np.argmax(bright_pred, axis=1)
+
+print("\nAccuracy with brightness variation:",
+      accuracy_score(bright_val.classes, bright_pred))
+
+
+# ============================================================
+# STEP 7: LOAD SEGMENTATION DATASET
+# ============================================================
+
+import cv2
+import os
+
+IMG_SIZE = 128
+
+def load_segmentation_data(img_path, mask_path):
+
+    images = []
+    masks = []
+
+    for file in os.listdir(img_path):
+
+        img = cv2.imread(os.path.join(img_path, file))
+        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+        img = img / 255
+
+        mask = cv2.imread(os.path.join(mask_path, file), 0)
+        mask = cv2.resize(mask, (IMG_SIZE, IMG_SIZE))
+        mask = mask / 255
+        mask = np.expand_dims(mask, axis=-1)
+
+        images.append(img)
+        masks.append(mask)
+
+    return np.array(images), np.array(masks)
+
+X, Y = load_segmentation_data(seg_image_path, seg_mask_path)
+
+split = int(0.8 * len(X))
+
+X_train, X_test = X[:split], X[split:]
+Y_train, Y_test = Y[:split], Y[split:]
+
+
+# ============================================================
+# STEP 8: BUILD U-NET SEGMENTATION MODEL
+# ============================================================
+
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, UpSampling2D, concatenate, Input
+
+def unet():
+
+    inputs = Input((IMG_SIZE, IMG_SIZE, 3))
+
+    c1 = Conv2D(32, 3, activation='relu', padding='same')(inputs)
+    p1 = MaxPooling2D()(c1)
+
+    c2 = Conv2D(64, 3, activation='relu', padding='same')(p1)
+    p2 = MaxPooling2D()(c2)
+
+    c3 = Conv2D(128, 3, activation='relu', padding='same')(p2)
+
+    u1 = UpSampling2D()(c3)
+    m1 = concatenate([u1, c2])
+
+    c4 = Conv2D(64, 3, activation='relu', padding='same')(m1)
+
+    u2 = UpSampling2D()(c4)
+    m2 = concatenate([u2, c1])
+
+    c5 = Conv2D(32, 3, activation='relu', padding='same')(m2)
+
+    outputs = Conv2D(1, 1, activation='sigmoid')(c5)
+
+    return Model(inputs, outputs)
+
+seg_model = unet()
+
+seg_model.compile(
+    optimizer='adam',
+    loss='binary_crossentropy',
+    metrics=['accuracy']
+)
+
+print("\nTraining Segmentation Model...")
+seg_model.fit(X_train, Y_train, epochs=5, validation_data=(X_test, Y_test))
+
+
+# ============================================================
+# STEP 9: SEGMENTATION METRICS
+# ============================================================
+
+pred_masks = seg_model.predict(X_test)
+
+def dice_score(y_true, y_pred):
+
+    y_true = y_true.flatten()
+    y_pred = y_pred.flatten()
+
+    intersection = np.sum(y_true * y_pred)
+
+    return (2*intersection)/(np.sum(y_true)+np.sum(y_pred)+1e-7)
+
+def iou_score(y_true, y_pred):
+
+    intersection = np.sum(y_true*y_pred)
+    union = np.sum(y_true)+np.sum(y_pred)-intersection
+
+    return intersection/(union+1e-7)
+
+print("\nSEGMENTATION RESULTS")
+
+print("Dice Score:", dice_score(Y_test, pred_masks))
+print("IoU Score:", iou_score(Y_test, pred_masks))
+
+
+# ============================================================
+# STEP 10: VISUALIZATION
+# ============================================================
+
+plt.figure(figsize=(12,4))
+
+plt.subplot(1,3,1)
+plt.imshow(X_test[0])
+plt.title("Original")
+
+plt.subplot(1,3,2)
+plt.imshow(Y_test[0].squeeze(), cmap='gray')
+plt.title("True Mask")
+
+plt.subplot(1,3,3)
+plt.imshow(pred_masks[0].squeeze(), cmap='gray')
+plt.title("Predicted Mask")
+
+plt.show()
+
+
+# ============================================================
+# COMPLETE
+# ============================================================
+
+print("\nFULL CASE STUDY COMPLETED SUCCESSFULLY")
